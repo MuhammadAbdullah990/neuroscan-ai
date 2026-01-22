@@ -2,14 +2,14 @@ import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
 import cv2
 import mediapipe as mp
-from deepface import DeepFace
+from fer import FER
 import numpy as np
 import av
 import threading
 import time
 import queue
 import pandas as pd
-import gc # Garbage Collector to save RAM
+import gc
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="NeuroScan: Behavioral Analysis", layout="wide", page_icon="🧠")
@@ -34,30 +34,22 @@ if "chart_data" not in st.session_state: st.session_state["chart_data"] = []
 if "data_queue" not in st.session_state: st.session_state["data_queue"] = queue.Queue()
 data_queue = st.session_state["data_queue"]
 
-# --- 2. SYSTEM STARTUP ---
+# --- 2. LIGHTWEIGHT SYSTEM STARTUP ---
 @st.cache_resource
 def load_models():
     # 1. Load MediaPipe
     mp_face = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
     
-    # 2. Force DeepFace Load (Using SFace - Lightweight Model)
-    print("System: Loading SFace Model...")
-    dummy_img = np.zeros((224, 224, 3), dtype=np.uint8)
-    try:
-        # We specify the model_name='SFace' to save 500MB of RAM
-        DeepFace.analyze(dummy_img, actions=['emotion'], enforce_detection=False, detector_backend="opencv")
-        print("System: SFace Loaded Successfully.")
-    except Exception as e:
-        print(f"System: Model Load Warning: {e}")
+    # 2. Load FER (Lightweight Emotion Engine)
+    # mtcnn=False means we use the fast OpenCV detector, not the slow deep learning one
+    detector = FER(mtcnn=False) 
     
-    # Clean up RAM immediately
-    gc.collect()
-    return mp_face
+    return mp_face, detector
 
-with st.spinner('Initializing AI Engine (Compact Mode)...'):
-    face_mesh = load_models()
+with st.spinner('Initializing Cloud-Safe AI Engine...'):
+    face_mesh, emotion_detector = load_models()
 
-# --- 3. AI ENGINE CLASS ---
+# --- 3. VIDEO PROCESSOR ---
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 
@@ -80,20 +72,31 @@ class NeuroProcessor(VideoTransformerBase):
 
     def analyze_emotion_thread(self, img_bgr):
         try:
-            face_norm = cv2.normalize(img_bgr, None, 0, 255, cv2.NORM_MINMAX)
-            # detector_backend='opencv' is faster and lighter than default
-            obj = DeepFace.analyze(face_norm, actions=['emotion'], enforce_detection=False, detector_backend="opencv")
-            emotions = obj[0]['emotion']
+            # FER Analysis
+            # This returns a list like [{'box': ..., 'emotions': {'angry': 0.1, 'happy': 0.9...}}]
+            analysis = emotion_detector.detect_emotions(img_bgr)
             
             dominant = "Neutral"
-            if emotions['sad'] > 15: dominant = "SAD" 
-            elif emotions['fear'] > 10: dominant = "FEAR"
-            elif emotions['angry'] > 15: dominant = "ANGRY"
-            elif emotions['happy'] > 50: dominant = "HAPPY"
-            else: dominant = "NEUTRAL"
+            if analysis:
+                # Get the first face found
+                emotions = analysis[0]['emotions']
+                
+                # Manual Dominance Logic
+                # We check the highest value
+                max_score = 0
+                for emo, score in emotions.items():
+                    if score > max_score:
+                        max_score = score
+                        dominant = emo.upper()
+                
+                # Sensitivity Tweaks
+                if emotions['sad'] > 0.20: dominant = "SAD"
+                if emotions['fear'] > 0.20: dominant = "FEAR"
+                if emotions['angry'] > 0.20: dominant = "ANGRY"
             
             self.last_emotion = dominant
             
+            # Colors
             if dominant == 'SAD': self.emotion_color = (0, 0, 255) 
             elif dominant == 'FEAR': self.emotion_color = (128, 0, 128) 
             elif dominant == 'ANGRY': self.emotion_color = (0, 0, 139) 
@@ -119,8 +122,8 @@ class NeuroProcessor(VideoTransformerBase):
                         if self.blink_consec_frames >= 1: data_queue.put({"type": "blink"})
                         self.blink_consec_frames = 0
                     
-                    # Run every 15 frames to save CPU
-                    if self.frame_counter % 15 == 0 and not self.processing:
+                    # Run every 10 frames (Fast & Light)
+                    if self.frame_counter % 10 == 0 and not self.processing:
                         self.processing = True
                         threading.Thread(target=self.analyze_emotion_thread, args=(img.copy(),)).start()
 
@@ -130,7 +133,7 @@ class NeuroProcessor(VideoTransformerBase):
             self.frame_counter += 1
             return av.VideoFrame.from_ndarray(img, format="bgr24")
         except Exception:
-            return frame # Return original frame if crash occurs to keep stream alive
+            return frame
 
 # --- 4. UI LAYOUT ---
 st.title("🧠 NeuroScan: Behavioral Risk Assessment")
@@ -199,17 +202,20 @@ if st.button("Reset / Clear Data"):
     st.session_state["emotion_log"] = []
     st.session_state["blink_count"] = 0
     st.session_state["chart_data"] = []
-    st.rerun() # Fixed the error here
+    st.rerun()
 
 if st.button("Generate Behavioral Analysis Report"):
     if len(st.session_state["emotion_log"]) > 0:
         st.subheader("📋 Psychological Risk Assessment")
         
         total = len(st.session_state["emotion_log"])
-        sad_pct = (st.session_state["emotion_log"].count("SAD") / total) * 100
-        neutral_pct = (st.session_state["emotion_log"].count("NEUTRAL") / total) * 100
-        fear_pct = (st.session_state["emotion_log"].count("FEAR") / total) * 100
-        angry_pct = (st.session_state["emotion_log"].count("ANGRY") / total) * 100
+        # FER returns lowercase usually, ensuring safety
+        logs = [e.upper() for e in st.session_state["emotion_log"]]
+        
+        sad_pct = (logs.count("SAD") / total) * 100
+        neutral_pct = (logs.count("NEUTRAL") / total) * 100
+        fear_pct = (logs.count("FEAR") / total) * 100
+        angry_pct = (logs.count("ANGRY") / total) * 100
         
         observations = []
         risk_level = "Low"
@@ -237,7 +243,7 @@ if st.button("Generate Behavioral Analysis Report"):
         with c2:
             chart_df = pd.DataFrame({
                 "Affect": ["Negative", "Anxiety", "Agitation", "Neutral", "Positive"],
-                "Duration": [sad_pct, fear_pct, angry_pct, neutral_pct, st.session_state["emotion_log"].count("HAPPY")/total*100]
+                "Duration": [sad_pct, fear_pct, angry_pct, neutral_pct, logs.count("HAPPY")/total*100]
             })
             st.bar_chart(chart_df.set_index("Affect"))
             
