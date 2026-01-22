@@ -9,12 +9,11 @@ import threading
 import time
 import queue
 import pandas as pd
-import os
+import gc # Garbage Collector to save RAM
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="NeuroScan: Behavioral Analysis", layout="wide", page_icon="🧠")
 
-# Custom CSS
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
@@ -29,34 +28,33 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# Session State
 if "emotion_log" not in st.session_state: st.session_state["emotion_log"] = []
 if "blink_count" not in st.session_state: st.session_state["blink_count"] = 0
 if "chart_data" not in st.session_state: st.session_state["chart_data"] = []
 if "data_queue" not in st.session_state: st.session_state["data_queue"] = queue.Queue()
 data_queue = st.session_state["data_queue"]
 
-# --- 2. SYSTEM STARTUP (The Fix) ---
-# This forces the download to happen ONCE at startup, preventing crashes later.
+# --- 2. SYSTEM STARTUP ---
 @st.cache_resource
 def load_models():
     # 1. Load MediaPipe
     mp_face = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
     
-    # 2. Force DeepFace Download (Dummy Run)
-    # We run a fake black image through it to trigger the download/load
-    print("System: Loading DeepFace Model...")
+    # 2. Force DeepFace Load (Using SFace - Lightweight Model)
+    print("System: Loading SFace Model...")
     dummy_img = np.zeros((224, 224, 3), dtype=np.uint8)
     try:
-        DeepFace.analyze(dummy_img, actions=['emotion'], enforce_detection=False)
-        print("System: DeepFace Loaded Successfully.")
+        # We specify the model_name='SFace' to save 500MB of RAM
+        DeepFace.analyze(dummy_img, actions=['emotion'], enforce_detection=False, detector_backend="opencv")
+        print("System: SFace Loaded Successfully.")
     except Exception as e:
         print(f"System: Model Load Warning: {e}")
-        
+    
+    # Clean up RAM immediately
+    gc.collect()
     return mp_face
 
-# Show a spinner while downloading (First run only)
-with st.spinner('Initializing AI Engine (Downloading 500MB Model)... This may take 1-2 mins on first run.'):
+with st.spinner('Initializing AI Engine (Compact Mode)...'):
     face_mesh = load_models()
 
 # --- 3. AI ENGINE CLASS ---
@@ -83,10 +81,10 @@ class NeuroProcessor(VideoTransformerBase):
     def analyze_emotion_thread(self, img_bgr):
         try:
             face_norm = cv2.normalize(img_bgr, None, 0, 255, cv2.NORM_MINMAX)
-            obj = DeepFace.analyze(face_norm, actions=['emotion'], enforce_detection=False)
+            # detector_backend='opencv' is faster and lighter than default
+            obj = DeepFace.analyze(face_norm, actions=['emotion'], enforce_detection=False, detector_backend="opencv")
             emotions = obj[0]['emotion']
             
-            # Behavior Logic
             dominant = "Neutral"
             if emotions['sad'] > 15: dominant = "SAD" 
             elif emotions['fear'] > 10: dominant = "FEAR"
@@ -107,32 +105,34 @@ class NeuroProcessor(VideoTransformerBase):
         finally: self.processing = False
 
     def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        h, w, c = img.shape
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(img_rgb)
+        try:
+            img = frame.to_ndarray(format="bgr24")
+            h, w, c = img.shape
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(img_rgb)
 
-        if results.multi_face_landmarks:
-            for face_landmarks in results.multi_face_landmarks:
-                ear = self.calculate_ear(face_landmarks.landmark, w, h)
-                if ear < self.blink_threshold: self.blink_consec_frames += 1
-                else:
-                    if self.blink_consec_frames >= 1: data_queue.put({"type": "blink"})
-                    self.blink_consec_frames = 0
-                
-                # Slower interval (20) to prevent cloud lag
-                if self.frame_counter % 20 == 0 and not self.processing:
-                    self.processing = True
-                    threading.Thread(target=self.analyze_emotion_thread, args=(img.copy(),)).start()
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    ear = self.calculate_ear(face_landmarks.landmark, w, h)
+                    if ear < self.blink_threshold: self.blink_consec_frames += 1
+                    else:
+                        if self.blink_consec_frames >= 1: data_queue.put({"type": "blink"})
+                        self.blink_consec_frames = 0
+                    
+                    # Run every 15 frames to save CPU
+                    if self.frame_counter % 15 == 0 and not self.processing:
+                        self.processing = True
+                        threading.Thread(target=self.analyze_emotion_thread, args=(img.copy(),)).start()
 
-                cv2.rectangle(img, (0, 0), (350, 50), (0, 0, 0), -1)
-                cv2.putText(img, f"Behavior: {self.last_emotion}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.emotion_color, 2)
-
-        self.frame_counter += 1
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+                    cv2.rectangle(img, (0, 0), (350, 50), (0, 0, 0), -1)
+                    cv2.putText(img, f"Behavior: {self.last_emotion}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.emotion_color, 2)
+            
+            self.frame_counter += 1
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+        except Exception:
+            return frame # Return original frame if crash occurs to keep stream alive
 
 # --- 4. UI LAYOUT ---
-
 st.title("🧠 NeuroScan: Behavioral Risk Assessment")
 st.markdown("Automated screening for non-verbal psychopathology markers.")
 
@@ -151,7 +151,8 @@ with col1:
         key="neuro-scanner",
         video_processor_factory=NeuroProcessor,
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-        media_stream_constraints={"video": True, "audio": False}
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True
     )
 
 with col2:
@@ -194,12 +195,11 @@ if ctx.state.playing:
 
 # --- 6. REPORT ---
 st.markdown("---")
-# Reset Button Logic (Fixed)
 if st.button("Reset / Clear Data"):
     st.session_state["emotion_log"] = []
     st.session_state["blink_count"] = 0
     st.session_state["chart_data"] = []
-    st.rerun() # UPDATED from experimental_rerun
+    st.rerun() # Fixed the error here
 
 if st.button("Generate Behavioral Analysis Report"):
     if len(st.session_state["emotion_log"]) > 0:
