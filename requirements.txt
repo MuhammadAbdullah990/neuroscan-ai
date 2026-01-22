@@ -1,0 +1,10 @@
+streamlit
+streamlit-webrtc
+opencv-python-headless
+mediapipe
+deepface
+tf-keras
+tensorflow-cpu
+av
+numpy<2
+pandas
