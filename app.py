@@ -9,11 +9,12 @@ import threading
 import time
 import queue
 import pandas as pd
+import os
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="NeuroScan: Behavioral Analysis", layout="wide", page_icon="🧠")
 
-# Custom CSS for "Medical" Look
+# Custom CSS
 st.markdown("""
     <style>
     .stApp { background-color: #0e1117; }
@@ -28,22 +29,40 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+# Session State
 if "emotion_log" not in st.session_state: st.session_state["emotion_log"] = []
 if "blink_count" not in st.session_state: st.session_state["blink_count"] = 0
 if "chart_data" not in st.session_state: st.session_state["chart_data"] = []
-
-@st.cache_resource
-def load_mediapipe():
-    return mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
-face_mesh = load_mediapipe()
-
 if "data_queue" not in st.session_state: st.session_state["data_queue"] = queue.Queue()
 data_queue = st.session_state["data_queue"]
 
+# --- 2. SYSTEM STARTUP (The Fix) ---
+# This forces the download to happen ONCE at startup, preventing crashes later.
+@st.cache_resource
+def load_models():
+    # 1. Load MediaPipe
+    mp_face = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
+    
+    # 2. Force DeepFace Download (Dummy Run)
+    # We run a fake black image through it to trigger the download/load
+    print("System: Loading DeepFace Model...")
+    dummy_img = np.zeros((224, 224, 3), dtype=np.uint8)
+    try:
+        DeepFace.analyze(dummy_img, actions=['emotion'], enforce_detection=False)
+        print("System: DeepFace Loaded Successfully.")
+    except Exception as e:
+        print(f"System: Model Load Warning: {e}")
+        
+    return mp_face
+
+# Show a spinner while downloading (First run only)
+with st.spinner('Initializing AI Engine (Downloading 500MB Model)... This may take 1-2 mins on first run.'):
+    face_mesh = load_models()
+
+# --- 3. AI ENGINE CLASS ---
 LEFT_EYE = [362, 385, 387, 263, 373, 380]
 RIGHT_EYE = [33, 160, 158, 133, 153, 144]
 
-# --- 2. AI ENGINE (SAME LOGIC) ---
 class NeuroProcessor(VideoTransformerBase):
     def __init__(self):
         self.frame_counter = 0
@@ -63,17 +82,12 @@ class NeuroProcessor(VideoTransformerBase):
 
     def analyze_emotion_thread(self, img_bgr):
         try:
-            # Pre-processing for better detection
             face_norm = cv2.normalize(img_bgr, None, 0, 255, cv2.NORM_MINMAX)
             obj = DeepFace.analyze(face_norm, actions=['emotion'], enforce_detection=False)
-            
-            # RAW EMOTIONS
             emotions = obj[0]['emotion']
             
-            # BEHAVIOR MAPPING (Logic to catch hidden signals)
+            # Behavior Logic
             dominant = "Neutral"
-            
-            # Logic: Even small sadness triggers "Dysphoria"
             if emotions['sad'] > 15: dominant = "SAD" 
             elif emotions['fear'] > 10: dominant = "FEAR"
             elif emotions['angry'] > 15: dominant = "ANGRY"
@@ -82,12 +96,11 @@ class NeuroProcessor(VideoTransformerBase):
             
             self.last_emotion = dominant
             
-            # Map Colors
-            if dominant == 'SAD': self.emotion_color = (0, 0, 255) # Red
-            elif dominant == 'FEAR': self.emotion_color = (128, 0, 128) # Purple
-            elif dominant == 'ANGRY': self.emotion_color = (0, 0, 139) # Dark Red
-            elif dominant == 'HAPPY': self.emotion_color = (0, 255, 0) # Green
-            else: self.emotion_color = (255, 255, 0) # Yellow
+            if dominant == 'SAD': self.emotion_color = (0, 0, 255) 
+            elif dominant == 'FEAR': self.emotion_color = (128, 0, 128) 
+            elif dominant == 'ANGRY': self.emotion_color = (0, 0, 139) 
+            elif dominant == 'HAPPY': self.emotion_color = (0, 255, 0) 
+            else: self.emotion_color = (255, 255, 0) 
             
             data_queue.put({"type": "emotion", "value": dominant})
         except: pass
@@ -102,32 +115,27 @@ class NeuroProcessor(VideoTransformerBase):
         if results.multi_face_landmarks:
             for face_landmarks in results.multi_face_landmarks:
                 ear = self.calculate_ear(face_landmarks.landmark, w, h)
-                
-                # Blink Detection
                 if ear < self.blink_threshold: self.blink_consec_frames += 1
                 else:
                     if self.blink_consec_frames >= 1: data_queue.put({"type": "blink"})
                     self.blink_consec_frames = 0
                 
-                # Emotion Thread
-                if self.frame_counter % 10 == 0 and not self.processing:
+                # Slower interval (20) to prevent cloud lag
+                if self.frame_counter % 20 == 0 and not self.processing:
                     self.processing = True
                     threading.Thread(target=self.analyze_emotion_thread, args=(img.copy(),)).start()
 
-                # Clean Overlay
                 cv2.rectangle(img, (0, 0), (350, 50), (0, 0, 0), -1)
                 cv2.putText(img, f"Behavior: {self.last_emotion}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.emotion_color, 2)
 
         self.frame_counter += 1
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# --- 3. UI LAYOUT ---
+# --- 4. UI LAYOUT ---
 
 st.title("🧠 NeuroScan: Behavioral Risk Assessment")
 st.markdown("Automated screening for non-verbal psychopathology markers.")
 
-# *** NEW: THE PROMPT BOX ***
-# This answers the "Why are they sitting there?" question
 st.markdown("""
 <div class="prompt-box">
     <b>🗣️ Clinical Prompt:</b> <br>
@@ -150,14 +158,12 @@ with col2:
     st.markdown("#### Live Behavioral Metrics")
     emo_metric = st.empty()
     emo_metric.metric("Dominant Expression", "Waiting...")
-    
     blink_metric = st.empty()
     blink_metric.metric("Blink Rate (Arousal)", "0")
-    
     st.markdown("#### Emotional Volatility")
     chart_placeholder = st.empty()
 
-# --- 4. DATA LOOP ---
+# --- 5. DATA LOOP ---
 if ctx.state.playing:
     while True:
         try:
@@ -167,7 +173,6 @@ if ctx.state.playing:
                 curr_emo = data["value"]
                 st.session_state["emotion_log"].append(curr_emo)
                 
-                # REFRAMING: Emotion -> Behavior Label on Screen
                 display_label = curr_emo
                 if curr_emo == "SAD": display_label = "Dysphoria (Sadness)"
                 if curr_emo == "NEUTRAL": display_label = "Flat Affect (Neutral)"
@@ -175,7 +180,6 @@ if ctx.state.playing:
                 
                 emo_metric.metric("Dominant Expression", display_label)
                 
-                # Chart Data (1=Negative, 0=Positive/Neutral)
                 stress_val = 1 if curr_emo in ["SAD", "FEAR", "ANGRY"] else 0
                 st.session_state["chart_data"].append(stress_val)
                 if len(st.session_state["chart_data"]) > 50: st.session_state["chart_data"].pop(0)
@@ -188,70 +192,56 @@ if ctx.state.playing:
         except queue.Empty: continue
         except Exception: break
 
-# --- 5. BEHAVIORAL REPORT (The "Prediction") ---
+# --- 6. REPORT ---
 st.markdown("---")
+# Reset Button Logic (Fixed)
+if st.button("Reset / Clear Data"):
+    st.session_state["emotion_log"] = []
+    st.session_state["blink_count"] = 0
+    st.session_state["chart_data"] = []
+    st.rerun() # UPDATED from experimental_rerun
+
 if st.button("Generate Behavioral Analysis Report"):
     if len(st.session_state["emotion_log"]) > 0:
         st.subheader("📋 Psychological Risk Assessment")
         
-        # Calculate Data
         total = len(st.session_state["emotion_log"])
         sad_pct = (st.session_state["emotion_log"].count("SAD") / total) * 100
         neutral_pct = (st.session_state["emotion_log"].count("NEUTRAL") / total) * 100
         fear_pct = (st.session_state["emotion_log"].count("FEAR") / total) * 100
         angry_pct = (st.session_state["emotion_log"].count("ANGRY") / total) * 100
-        happy_pct = (st.session_state["emotion_log"].count("HAPPY") / total) * 100
-        
-        # --- THE BEHAVIOR TRANSLATION LAYER ---
-        # This converts "Emotions" into "Medical Predictions"
         
         observations = []
         risk_level = "Low"
         
-        # 1. Anhedonia / Depression Check
         if sad_pct > 20:
             observations.append(f"🔴 **Dysphoria Detected ({sad_pct:.1f}%):** Significant duration of negative affect.")
             risk_level = "Moderate"
-        if sad_pct + neutral_pct > 85 and happy_pct < 5:
-            observations.append("🔴 **Flat Affect / Anhedonia:** Lack of emotional reactivity (Potential Depressive Symptom).")
+        if sad_pct + neutral_pct > 85:
+            observations.append("🔴 **Flat Affect / Anhedonia:** Lack of emotional reactivity.")
             risk_level = "High"
-
-        # 2. Anxiety / Arousal Check
         if fear_pct > 15:
-            observations.append(f"🟠 **Hyper-Arousal ({fear_pct:.1f}%):** Micro-expressions of fear/worry detected.")
+            observations.append(f"🟠 **Hyper-Arousal ({fear_pct:.1f}%):** Micro-expressions of fear/worry.")
             if risk_level == "Low": risk_level = "Moderate"
-        
         if st.session_state["blink_count"] > 20:
-             observations.append(f"🟠 **High Psychomotor Activity:** Rapid blinking ({st.session_state['blink_count']} blinks) suggests situational anxiety or stress.")
-
-        # 3. Stress / Irritability Check
+             observations.append(f"🟠 **High Psychomotor Activity:** Rapid blinking ({st.session_state['blink_count']} blinks).")
         if angry_pct > 15:
              observations.append(f"🟡 **Irritability:** Signs of agitation detected.")
-
-        # 4. Normal Check
         if risk_level == "Low" and not observations:
-            observations.append("🟢 **Euthymic Mood:** Emotional range appears within normal limits.")
+            observations.append("🟢 **Euthymic Mood:** Emotional range appears normal.")
 
-        # Display Report
         c1, c2 = st.columns([2, 1])
         with c1:
             st.info(f"**Overall Behavioral Risk:** {risk_level}")
-            st.write("### Observed Behavioral Markers:")
-            for obs in observations:
-                st.markdown(obs)
-                
+            for obs in observations: st.markdown(obs)
         with c2:
-            st.write("**Affect Distribution:**")
-            # Create a clean DataFrame for the chart
             chart_df = pd.DataFrame({
-                "Affect": ["Negative (Sad)", "Anxiety (Fear)", "Agitation (Angry)", "Neutral", "Positive"],
-                "Duration": [sad_pct, fear_pct, angry_pct, neutral_pct, happy_pct]
+                "Affect": ["Negative", "Anxiety", "Agitation", "Neutral", "Positive"],
+                "Duration": [sad_pct, fear_pct, angry_pct, neutral_pct, st.session_state["emotion_log"].count("HAPPY")/total*100]
             })
             st.bar_chart(chart_df.set_index("Affect"))
             
-        # Download
         csv = chart_df.to_csv().encode('utf-8')
         st.download_button("📥 Download Clinical Data", csv, "behavior_report.csv", "text/csv")
-        
     else:
         st.warning("No session data. Please Start the camera.")
